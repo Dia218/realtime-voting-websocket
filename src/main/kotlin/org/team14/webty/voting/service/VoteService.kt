@@ -6,6 +6,7 @@ import org.team14.webty.common.exception.BusinessException
 import org.team14.webty.common.exception.ErrorCode
 import org.team14.webty.security.authentication.AuthWebtyUserProvider
 import org.team14.webty.security.authentication.WebtyUserDetails
+import org.team14.webty.voting.cache.VoteCacheService
 import org.team14.webty.voting.dto.VoteRequest
 import org.team14.webty.voting.entity.Similar
 import org.team14.webty.voting.entity.Vote
@@ -19,6 +20,7 @@ import java.util.function.Supplier
 class VoteService(
     private val voteRepository: VoteRepository,
     private val similarRepository: SimilarRepository,
+    private val voteCacheService: VoteCacheService,
     private val authWebtyUserProvider: AuthWebtyUserProvider
 ) {
     // 유사 투표
@@ -26,13 +28,17 @@ class VoteService(
     fun vote(webtyUserDetails: WebtyUserDetails, voteRequest: VoteRequest): Long {
         val webtyUser = authWebtyUserProvider.getAuthenticatedWebtyUser(webtyUserDetails)
         val similar = similarRepository.findById(voteRequest.similarId)
-            .orElseThrow<BusinessException> { BusinessException(ErrorCode.SIMILAR_NOT_FOUND) }!!
+            .orElseThrow { BusinessException(ErrorCode.SIMILAR_NOT_FOUND) }
         // 중복 투표 방지
         if (voteRepository.existsByUserIdAndSimilar(webtyUser.userId!!, similar)) {
             throw BusinessException(ErrorCode.VOTE_ALREADY_EXISTS)
         }
         val vote = toEntity(webtyUser, similar, voteRequest.voteType)
         voteRepository.save(vote)
+
+        // Redis에 투표 수 반영
+        voteCacheService.incrementVote(similar.similarId!!, VoteType.fromString(voteRequest.voteType))
+
         updateSimilarResult(similar)
         return vote.voteId!!
     }
@@ -44,16 +50,27 @@ class VoteService(
         val vote: Vote = voteRepository.findById(voteId)
             .orElseThrow(Supplier { BusinessException(ErrorCode.VOTE_NOT_FOUND) })
         voteRepository.delete(vote)
+
+        // Redis에서 투표 수 감소
+        voteCacheService.decrementVote(vote.similar.similarId!!, vote.voteType)
+        
         updateSimilarResult(vote.similar)
     }
 
     private fun updateSimilarResult(existingSimilar: Similar) {
-        // agree 및 disagree 투표 개수 가져오기
-        val agreeCount = voteRepository.countBySimilarAndVoteType(existingSimilar, VoteType.AGREE) // 동의 수
-        val disagreeCount = voteRepository.countBySimilarAndVoteType(existingSimilar, VoteType.DISAGREE) // 비동의 수
+        val similarId = existingSimilar.similarId!!
+
+        // Redis에서 동의 및 비동의 투표 수 가져오기
+        val agreeCount = voteCacheService.getVoteCount(similarId, VoteType.AGREE)
+        val disagreeCount = voteCacheService.getVoteCount(similarId, VoteType.DISAGREE)
 
         // similarResult 업데이트
-        val updateSimilar = existingSimilar.copy(similarResult = agreeCount - disagreeCount)
-        similarRepository.save<Similar>(updateSimilar)
+        val updatedSimilarResult = agreeCount - disagreeCount
+
+        // 기존 값과 비교하여 변경된 경우만 DB 업데이트
+        if (existingSimilar.similarResult != updatedSimilarResult) {
+            val updatedSimilar = existingSimilar.copy(similarResult = updatedSimilarResult)
+            similarRepository.save(updatedSimilar)
+        }
     }
 }

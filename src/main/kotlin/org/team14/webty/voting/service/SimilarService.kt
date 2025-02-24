@@ -1,6 +1,5 @@
 package org.team14.webty.voting.service
 
-import org.springframework.dao.DataIntegrityViolationException
 import org.springframework.data.domain.Page
 import org.springframework.data.domain.PageRequest
 import org.springframework.data.domain.Pageable
@@ -10,6 +9,7 @@ import org.team14.webty.common.exception.BusinessException
 import org.team14.webty.common.exception.ErrorCode
 import org.team14.webty.security.authentication.AuthWebtyUserProvider
 import org.team14.webty.security.authentication.WebtyUserDetails
+import org.team14.webty.voting.cache.VoteCacheService
 import org.team14.webty.voting.dto.SimilarResponse
 import org.team14.webty.voting.entity.Similar
 import org.team14.webty.voting.mapper.SimilarMapper.toEntity
@@ -17,15 +17,15 @@ import org.team14.webty.voting.mapper.SimilarMapper.toResponse
 import org.team14.webty.voting.repository.SimilarRepository
 import org.team14.webty.voting.repository.VoteRepository
 import org.team14.webty.webtoon.service.WebtoonService
-import java.util.function.Supplier
 
 
 @Service
 class SimilarService(
     private val similarRepository: SimilarRepository,
     private val webtoonService: WebtoonService,
-    private val authWebtyUserProvider: AuthWebtyUserProvider,
-    private val voteRepository: VoteRepository
+    private val voteRepository: VoteRepository,
+    private val voteCacheService: VoteCacheService,
+    private val authWebtyUserProvider: AuthWebtyUserProvider
 ) {
     // 유사 웹툰 등록
     @Transactional
@@ -42,16 +42,18 @@ class SimilarService(
             throw BusinessException(ErrorCode.SIMILAR_DUPLICATION_ERROR)
         }
 
+        val similar = toEntity(
+            webtyUser.userId!!,
+            choiceWebtoon.webtoonId ?: throw BusinessException(ErrorCode.WEBTOON_NOT_FOUND),
+            targetWebtoon
+        )
 
-        val similar = toEntity(webtyUser.userId!!,
-               choiceWebtoon.webtoonId?: throw BusinessException(ErrorCode.WEBTOON_NOT_FOUND),
-                                  targetWebtoon)
-        try {
+        runCatching {
             similarRepository.save(similar)
-        } catch (e: DataIntegrityViolationException) {
-            // 데이터베이스에서 UNIQUE 제약 조건 위반 발생 시 처리
+        }.onFailure { e ->
             throw BusinessException(ErrorCode.SIMILAR_DUPLICATION_ERROR)
         }
+
         return toResponse(similar, choiceWebtoon)
     }
 
@@ -62,9 +64,11 @@ class SimilarService(
         val similar = similarRepository.findByUserIdAndSimilarId(
             webtyUser.userId!!,
             similarId
-        )
-            .orElseThrow(Supplier { BusinessException(ErrorCode.SIMILAR_NOT_FOUND) })!!
-        voteRepository.deleteAll(voteRepository.findAllBySimilar(similar)) // 연관된 투표내역도 삭제
+        ).orElseThrow { BusinessException(ErrorCode.SIMILAR_NOT_FOUND) }
+
+        voteRepository.deleteAll(voteRepository.findAllBySimilar(similar)) // 연관된 투표내역 삭제
+        voteCacheService.deleteVotesForSimilar(similar.similarId!!) // redis 캐시 삭제
+
         similarRepository.delete(similar)
     }
 
